@@ -10,26 +10,27 @@ client = motor.motor_asyncio.AsyncIOMotorClient(DB_URL)
 database = client.StatusList
 collection = database.status
 
-async def fetch_one_status(name: str):
-    document = await collection.find_one({"name": name})
+def fix_mongo_id(document):
+    """Convert ObjectId to string in a MongoDB document"""
+    if document and "_id" in document:
+        document["_id"] = str(document["_id"])
     return document
 
 async def fetch_all_statuses():
     statuses = []
     cursor = collection.find({})
     async for document in cursor:
-        statuses.append(document)
+        statuses.append(fix_mongo_id(document))
     return statuses
 
-async def create_status(status_data: dict):
-    try:
-        result = await collection.insert_one(status_data)
-        if result.inserted_id:
-            return status_data
-        return None
-    except Exception as e:
-        print(f"Error creating status: {e}")
-        return None
+async def fetch_one_status(name):
+    document = await collection.find_one({"name": name})
+    return fix_mongo_id(document) if document else None
+
+async def create_status(status_data):
+    result = await collection.insert_one(status_data)
+    new_status = await collection.find_one({"_id": result.inserted_id})
+    return fix_mongo_id(new_status)
 
 async def update_status(name: str, status: str):
     try:
@@ -39,7 +40,7 @@ async def update_status(name: str, status: str):
         )
         if result.modified_count > 0:
             document = await collection.find_one({"name": name})
-            return document
+            return fix_mongo_id(document)
         return None
     except Exception as e:
         print(f"Error updating status: {e}")
