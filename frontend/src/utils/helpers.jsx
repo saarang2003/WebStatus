@@ -3,11 +3,11 @@ import { CheckCircle, XCircle, Clock } from 'lucide-react';
 export const getStatusIcon = (statusValue) => {
   switch (statusValue) {
     case 'UP':
-      return <CheckCircle className="w-5 h-5 text-green-500" />;
+      return < CheckCircle className="w-5 h-5 text-green-500" />;
     case 'Down':
-      return <XCircle className="w-5 h-5 text-red-500" />;
+      return < XCircle className="w-5 h-5 text-red-500" />;
     default:
-      return <Clock className="w-5 h-5 text-yellow-500 animate-spin" />;
+      return < Clock className="w-5 h-5 text-yellow-500 animate-spin" />;
   }
 };
 

@@ -1,6 +1,6 @@
 import React from 'react';
 import { Globe, BarChart3, Trash2 } from 'lucide-react';
-import { getStatusIcon, getStatusColor } from '../utils/helpers';
+import { getStatusIcon, getStatusColor } from '../utils/helpers.jsx';
 
 function StatusItem({ status, onDelete, onViewAnalytics }) {
   return (
