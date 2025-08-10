@@ -9,12 +9,6 @@ from dotenv import load_dotenv
 from datetime import datetime
 import smtplib
 from email.message import EmailMessage
-from database import (
-    log_status_history, 
-    update_status, 
-    get_websites_from_db,
-    log_status_change
-)
 
 load_dotenv()
 
@@ -23,6 +17,7 @@ DB_URL = os.getenv("DB_URL", "mongodb://localhost:27017")
 client = motor.motor_asyncio.AsyncIOMotorClient(DB_URL)
 database = client.StatusList
 collection = database.status
+history_collection = database.status_history
 
 # Email configuration (optional)
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
@@ -30,35 +25,68 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL")
 
 def get_website_status_with_metrics(url: str) -> tuple:
-    """Get website status with response time and status code"""
+    """Get website status with response time and status code - with proper error handling"""
+    start_time = time.time()
     try:
-        start_time = time.time()
-        response = requests.head(url, timeout=10, allow_redirects=True)
+        # Add timeout and proper headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Website Monitor Bot)'
+        }
+        response = requests.get(url, timeout=10, allow_redirects=True, headers=headers)
         response_time = time.time() - start_time
         
-        status = 'UP' if response.status_code == HTTPStatus.OK else 'Down'
+        # Consider 2xx and 3xx as UP, everything else as Down
+        status = 'UP' if 200 <= response.status_code < 400 else 'Down'
         return status, response_time, response.status_code
         
     except requests.exceptions.RequestException as e:
-        response_time = time.time() - start_time if 'start_time' in locals() else None
+        response_time = time.time() - start_time
         print(f"Error checking {url}: {e}")
         return 'Down', response_time, None
 
 async def get_websites_from_db():
-    """Get all websites from database"""
+    """Get ALL websites from database - including ones with 'Checking' status"""
     try:
         websites = []
-        cursor = collection.find({})
+        # ✅ FIXED: Don't filter out any status - get ALL websites
+        cursor = collection.find({})  # No filter to exclude "Checking"
         async for doc in cursor:
             websites.append({
                 'name': doc['name'], 
                 'url': doc['url'],
-                'current_status': doc.get('status', 'Unknown')
+                'current_status': doc.get('status', 'Checking')
             })
         return websites
     except Exception as e:
         print(f"Error fetching websites from database: {e}")
         return []
+
+async def log_status_history(name: str, url: str, status: str, response_time: float = None, status_code: int = None):
+    """Log each status check with detailed information"""
+    try:
+        await history_collection.insert_one({
+            "name": name,
+            "url": url,
+            "status": status,
+            "response_time": response_time,
+            "status_code": status_code,
+            "checked_at": datetime.utcnow()
+        })
+    except Exception as e:
+        print(f"Error logging status history: {e}")
+
+async def log_status_change(name: str, old_status: str, new_status: str):
+    """Log when a website status changes"""
+    try:
+        await history_collection.insert_one({
+            "name": name,
+            "event_type": "status_change",
+            "old_status": old_status,
+            "new_status": new_status,
+            "changed_at": datetime.utcnow()
+        })
+    except Exception as e:
+        print(f"Error logging status change: {e}")
 
 async def send_email_alert(name: str, url: str, old_status: str, new_status: str):
     """Send email alert when status changes"""
@@ -94,13 +122,13 @@ This is an automated alert from your website monitoring system.
         print(f"Error sending email alert: {e}")
 
 async def update_website_status_with_alerts(name: str, url: str, status: str, response_time: float, status_code: int):
-    """Update website status and send alerts if status changed"""
+    """✅ FIXED: Always update website status, even from 'Checking' state"""
     try:
         # Get current status before updating
         old_doc = await collection.find_one({"name": name})
-        old_status = old_doc["status"] if old_doc else None
+        old_status = old_doc["status"] if old_doc else "Unknown"
         
-        # Update the status
+        # ✅ FIXED: Always update the status with proper timestamp
         result = await collection.update_one(
             {"name": name}, 
             {"$set": {
@@ -114,19 +142,21 @@ async def update_website_status_with_alerts(name: str, url: str, status: str, re
         # Log the status check
         await log_status_history(name, url, status, response_time, status_code)
         
-        # Send email alert if status changed
-        if old_status and old_status != status:
+        # Send email alert if status changed AND it's not the first check
+        if old_status and old_status != "Checking" and old_status != status:
             print(f"Status change detected for {name}: {old_status} → {status}")
             await send_email_alert(name, url, old_status, status)
             await log_status_change(name, old_status, status)
-        
-        print(f"Updated {name}: {status} (Response: {response_time:.3f}s)")
+        elif old_status == "Checking":
+            print(f"Initial check complete for {name}: {status} (Response: {response_time:.3f}s)")
+        else:
+            print(f"Updated {name}: {status} (Response: {response_time:.3f}s)")
         
     except Exception as e:
         print(f"Error updating {name}: {e}")
 
 async def check_all_websites():
-    """Check all websites and update their status with analytics"""
+    """✅ FIXED: Check ALL websites including those with 'Checking' status"""
     websites = await get_websites_from_db()
     if not websites:
         print("No websites to check")
@@ -140,12 +170,13 @@ async def check_all_websites():
         task = check_single_website(site)
         tasks.append(task)
     
-    await asyncio.gather(*tasks)
+    await asyncio.gather(*tasks, return_exceptions=True)
     print("Finished checking all websites")
 
 async def check_single_website(site):
-    """Check a single website"""
+    """Check a single website with proper error handling"""
     try:
+        print(f"Checking {site['name']} ({site['url']})...")
         status, response_time, status_code = get_website_status_with_metrics(site['url'])
         await update_website_status_with_alerts(
             site['name'], 
@@ -156,6 +187,17 @@ async def check_single_website(site):
         )
     except Exception as e:
         print(f"Error checking {site['name']}: {e}")
+        # ✅ FIXED: Even on error, update status to Down
+        try:
+            await update_website_status_with_alerts(
+                site['name'], 
+                site['url'], 
+                'Down', 
+                None, 
+                None
+            )
+        except Exception as inner_e:
+            print(f"Error updating failed check for {site['name']}: {inner_e}")
 
 async def cleanup_old_history(days_to_keep: int = 30):
     """Clean up old history data to prevent database bloat"""
@@ -163,7 +205,6 @@ async def cleanup_old_history(days_to_keep: int = 30):
         from datetime import timedelta
         cutoff_date = datetime.utcnow() - timedelta(days=days_to_keep)
         
-        history_collection = database.status_history
         result = await history_collection.delete_many({
             "checked_at": {"$lt": cutoff_date}
         })
@@ -172,30 +213,9 @@ async def cleanup_old_history(days_to_keep: int = 30):
     except Exception as e:
         print(f"Error cleaning up old history: {e}")
 
-# Enhanced scheduler with different intervals
-async def scheduler_loop():
-    """Main scheduler loop with multiple check intervals"""
-    print("Starting enhanced website status checker...")
-    
-    # Run initial check
-    print("Running initial check...")
-    await check_all_websites()
-    
-    # Schedule different tasks
-    schedule.every(2).minutes.do(lambda: asyncio.create_task(check_all_websites()))
-    schedule.every().day.at("02:00").do(lambda: asyncio.create_task(cleanup_old_history()))
-    
-    print("Scheduled tasks:")
-    print("- Website checks: Every 2 minutes")
-    print("- Cleanup old data: Daily at 2:00 AM")
-    
-    while True:
-        schedule.run_pending()
-        await asyncio.sleep(30)  # Check every 30 seconds for pending tasks
-
-# Alternative: Run checks at specific intervals without schedule library
+# ✅ FIXED: Simple continuous monitoring without schedule library issues
 async def continuous_monitoring():
-    """Alternative monitoring approach with configurable intervals"""
+    """Continuous monitoring approach with configurable intervals"""
     CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_MINUTES", "2")) * 60  # Convert to seconds
     CLEANUP_INTERVAL = 24 * 3600  # 24 hours in seconds
     
@@ -203,8 +223,15 @@ async def continuous_monitoring():
     
     print(f"Starting continuous monitoring (check every {CHECK_INTERVAL//60} minutes)")
     
+    # Run initial check immediately
+    print("Running initial check...")
+    await check_all_websites()
+    
     while True:
         try:
+            # Wait for next check
+            await asyncio.sleep(CHECK_INTERVAL)
+            
             # Run website checks
             await check_all_websites()
             
@@ -214,28 +241,36 @@ async def continuous_monitoring():
                 await cleanup_old_history()
                 last_cleanup = current_time
             
-            # Wait for next check
-            await asyncio.sleep(CHECK_INTERVAL)
-            
+        except KeyboardInterrupt:
+            print("\nShutting down gracefully...")
+            break
         except Exception as e:
             print(f"Error in monitoring loop: {e}")
             await asyncio.sleep(60)  # Wait 1 minute before retrying
+
+# ✅ FIXED: One-time check function for testing
+async def run_single_check():
+    """Run a single check of all websites (useful for testing)"""
+    print("Running single check of all websites...")
+    await check_all_websites()
+    print("Single check complete!")
 
 if __name__ == "__main__":
     print("Website Status Checker with Analytics")
     print("=====================================")
     
-    # Choose monitoring method
-    monitoring_method = os.getenv("MONITORING_METHOD", "continuous")  # or "schedule"
+    # Choose what to run
+    run_mode = os.getenv("RUN_MODE", "continuous")  # Options: continuous, single
     
     try:
-        if monitoring_method == "schedule":
-            asyncio.run(scheduler_loop())
+        if run_mode == "single":
+            # For testing - just run once and exit
+            asyncio.run(run_single_check())
         else:
+            # Default - continuous monitoring
             asyncio.run(continuous_monitoring())
     except KeyboardInterrupt:
         print("\nShutting down gracefully...")
     except Exception as e:
         print(f"Unexpected error: {e}")
-        print("Restarting in 10 seconds...")
-        time.sleep(10)
+        print("Check your database connection and try again.")
