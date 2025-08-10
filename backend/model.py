@@ -32,7 +32,7 @@ class StatusHistory(BaseModel):
 
 class UptimeAnalytics(BaseModel):
     uptime_percentage: float
-    total_checks: int
+    total_checks: int 
     up_checks: int
     down_checks: int
 
