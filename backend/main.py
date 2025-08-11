@@ -1,24 +1,32 @@
-# main.py - Simple Website Monitor Backend (Fixed)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from typing import Dict, Optional, List
+from datetime import datetime
+from urllib.parse import urlparse
 import requests
 import time
-from typing import Dict, List, Optional
-from datetime import datetime
+import ssl
+import socket
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Simple Website Monitor", version="1.0.0")
 
-# CORS
+# Enable CORS
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_credentials=True, 
+    allow_methods=["*"], 
+    allow_headers=["*"]
 )
 
-# Data models
+# ---------- Data Models ----------
+
 class Website(BaseModel):
     name: str
     url: str
@@ -27,64 +35,80 @@ class WebsiteStatus(BaseModel):
     name: str
     url: str
     status: str  # "UP" or "DOWN"
-    response_time: float  # in seconds
-    status_code: int = Field(default=0)  # 0 = unreachable, with explicit default
+    response_time: float
+    status_code: int = Field(default=0)
     traffic_info: str
     last_checked: str
+    ssl_expiry_days: Optional[int] = Field(default=None, description="Days until SSL certificate expires")
+    ssl_status: Optional[str] = Field(default=None, description="SSL certificate status")
 
-# In-memory storage
+# ---------- In-Memory Storage ----------
 websites: Dict[str, WebsiteStatus] = {}
 
-def check_website_status(url: str) -> tuple:
-    """Check website and return status, response_time, status_code"""
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
+# ---------- Utility Functions ----------
 
-    start_time = time.time()
-    
+def extract_hostname(url: str) -> Optional[str]:
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Website Monitor)'}
-        response = requests.get(url, timeout=10, headers=headers, allow_redirects=True)
-        response_time = time.time() - start_time
-        status_code = response.status_code
-        status = "UP" if 200 <= response.status_code < 400 else "DOWN"
-        
-        # Ensure status_code is always an integer
-        status_code = int(status_code) if status_code is not None else 0
-        print(f"SUCCESS: {url} -> status_code: {status_code}, type: {type(status_code)}")
-        return status, response_time, status_code
-        
-    except requests.exceptions.Timeout:
-        print(f"Timeout checking {url}")
-        response_time = time.time() - start_time
-        return "DOWN", response_time, 0
-        
-    except requests.exceptions.ConnectionError:
-        print(f"Connection error checking {url}")
-        response_time = time.time() - start_time
-        return "DOWN", response_time, 0
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Request error checking {url}: {e}")
-        response_time = time.time() - start_time
-        return "DOWN", response_time, 0
-        
+        parsed = urlparse(url if url.startswith("http") else f"https://{url}")
+        return parsed.hostname
     except Exception as e:
-        print(f"Unexpected error checking {url}: {e}")
-        response_time = time.time() - start_time
-        return "DOWN", response_time, 0
+        print(f"Error parsing URL {url}: {e}")
+        return None
+
+def check_website_status(url: str) -> tuple:
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    start = time.time()
+    try:
+        response = requests.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (Website Monitor)"},
+            allow_redirects=True
+        )
+        response_time = time.time() - start
+        status_code = int(response.status_code or 0)
+        status = "UP" if 200 <= status_code < 400 else "DOWN"
+        return status, response_time, status_code
+    except Exception as e:
+        print(f"Error checking {url}: {e}")
+        return "DOWN", time.time() - start, 0
+
 def get_traffic_info(response_time: float, status: str) -> str:
-    """Estimate traffic/load based on response time"""
     if status == "DOWN":
         return "Server Down or Unreachable"
     if response_time < 0.5:
         return "Fast Response (Low Traffic)"
-    elif response_time < 1.5:
+    if response_time < 1.5:
         return "Good Response (Normal Traffic)"
-    elif response_time < 3.0:
+    if response_time < 3.0:
         return "Slow Response (High Traffic)"
-    else:
-        return "Very Slow (Heavy Traffic or Server Issues)"
+    return "Very Slow (Heavy Traffic or Server Issues)"
+
+def get_ssl_expiry_days(hostname: str) -> Optional[int]:
+    if not hostname:
+        return None
+    
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((hostname, 443), timeout=10) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+        
+        if not cert or "notAfter" not in cert:
+            print(f"[SSL] No certificate found for {hostname}")
+            return None
+            
+        expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+        days_left = (expiry - datetime.utcnow()).days
+        print(f"[SSL] {hostname} SSL expires in {days_left} days")
+        return days_left
+    except Exception as e:
+        print(f"[SSL ERROR] {hostname}: {e}")
+        return None
+
+# ---------- API Endpoints ----------
 
 @app.get("/")
 def read_root():
@@ -92,88 +116,81 @@ def read_root():
         "message": "Simple Website Monitor API",
         "endpoints": {
             "add_website": "POST /api/websites",
-            "get_all": "GET /api/websites", 
+            "get_all": "GET /api/websites",
             "check_one": "GET /api/check/{name}",
-            "delete": "DELETE /api/websites/{name}"
+            "delete": "DELETE /api/websites/{name}",
+            "check_all": "POST /api/check-all",
+            "stats": "GET /api/stats"
         }
     }
 
-@app.post("/api/websites")
+@app.post("/api/websites", response_model=WebsiteStatus)
 def add_website(website: Website):
-    """Add a new website to monitor"""
+    if website.name in websites:
+        raise HTTPException(400, f"Website '{website.name}' already exists")
     try:
-        if website.name in websites:
-            raise HTTPException(400, f"Website '{website.name}' already exists")
+        status, rt, code = check_website_status(website.url)
+        traffic = get_traffic_info(rt, status)
 
-        # Immediately check
-        status, response_time, status_code = check_website_status(website.url)
-        traffic_info = get_traffic_info(response_time, status)
+        hostname = extract_hostname(website.url)
+        ssl_days = None
+        if hostname and website.url.startswith("https://"):
+            ssl_days = get_ssl_expiry_days(hostname)
 
-        # CRITICAL FIX: Ensure status_code is never None
-        if status_code is None:
-            status_code = 0
-        
-        website_status = WebsiteStatus(
+        ws = WebsiteStatus(
             name=website.name,
             url=website.url,
             status=status,
-            response_time=round(response_time, 3),
-            status_code=int(status_code),  # Now guaranteed to be an integer
-            traffic_info=traffic_info,
-            last_checked=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            response_time=round(rt, 3),
+            status_code=code,
+            traffic_info=traffic,
+            last_checked=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ssl_expiry_days=ssl_days
         )
-
-        websites[website.name] = website_status
-        return website_status
-        
-    except HTTPException:
-        raise
+        websites[website.name] = ws
+        print(f"[DEBUG] Added website: {ws.model_dump()}")  # Debug output
+        return ws
     except Exception as e:
         print(f"Error adding website {website.name}: {e}")
-        raise HTTPException(500, f"Failed to add website: {str(e)}")
+        raise HTTPException(500, f"Failed to add website: {e}")
 
-
-@app.get("/api/websites")
+@app.get("/api/websites", response_model=List[WebsiteStatus])
 def get_all_websites():
-    """Get all monitored websites"""
-    return list(websites.values())
+    result = list(websites.values())
+    print(f"[DEBUG] Returning {len(result)} websites")  # Debug output
+    for site in result:
+        print(f"[DEBUG] Site: {site.name}, SSL Days: {site.ssl_expiry_days}")
+    return result
 
-@app.get("/api/check/{name}")
+@app.get("/api/check/{name}", response_model=WebsiteStatus)
 def check_single_website(name: str):
-    """Re-check a specific website"""
+    if name not in websites:
+        raise HTTPException(404, f"Website '{name}' not found")
     try:
-        if name not in websites:
-            raise HTTPException(404, f"Website '{name}' not found")
+        current = websites[name]
+        status, rt, code = check_website_status(current.url)
+        traffic = get_traffic_info(rt, status)
 
-        website = websites[name]
-        status, response_time, status_code = check_website_status(website.url)
-        traffic_info = get_traffic_info(response_time, status)
+        hostname = extract_hostname(current.url)
+        ssl_days = None
+        if hostname and current.url.startswith("https://"):
+            ssl_days = get_ssl_expiry_days(hostname)
 
-        # Update the website status with maximum safety
-        safe_status_code = 0
-        if status_code is not None:
-            try:
-                safe_status_code = int(status_code)
-            except (ValueError, TypeError):
-                safe_status_code = 0
+        current.status = status
+        current.response_time = round(rt, 3)
+        current.status_code = code
+        current.traffic_info = traffic
+        current.last_checked = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current.ssl_expiry_days = ssl_days
 
-        websites[name].status = status
-        websites[name].response_time = round(response_time, 3)
-        websites[name].status_code = safe_status_code
-        websites[name].traffic_info = traffic_info
-        websites[name].last_checked = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        return websites[name]
-        
-    except HTTPException:
-        raise
+        print(f"[DEBUG] Updated website: {current.model_dump()}")  # Debug output
+        return current
     except Exception as e:
         print(f"Error checking website {name}: {e}")
-        raise HTTPException(500, f"Failed to check website: {str(e)}")
+        raise HTTPException(500, f"Failed to check website: {e}")
 
 @app.delete("/api/websites/{name}")
 def delete_website(name: str):
-    """Delete a website"""
     if name not in websites:
         raise HTTPException(404, f"Website '{name}' not found")
     del websites[name]
@@ -181,57 +198,41 @@ def delete_website(name: str):
 
 @app.post("/api/check-all")
 def check_all_websites():
-    """Re-check all websites"""
-    if not websites:
-        return {"message": "No websites to check"}
-
     results = []
-    for name in list(websites.keys()):
+    for name in list(websites):
         try:
-            updated_website = check_single_website(name)
-            results.append({
-                "name": name,
-                "status": "success", 
-                "data": updated_website
-            })
+            data = check_single_website(name)
+            results.append({"name": name, "status": "success", "data": data})
         except Exception as e:
-            print(f"Error checking {name}: {e}")
-            results.append({
-                "name": name,
-                "status": "error",
-                "error": str(e)
-            })
-
-    return {
-        "message": f"Checked {len(websites)} websites",
-        "results": results
-    }
+            results.append({"name": name, "status": "error", "error": str(e)})
+    return {"message": f"Checked {len(websites)} websites", "results": results}
 
 @app.get("/api/stats")
 def get_stats():
-    """Get statistics"""
     total = len(websites)
     up = sum(1 for w in websites.values() if w.status == "UP")
     down = total - up
-    avg_response_time = 0
+    avg = (
+        round(sum(w.response_time for w in websites.values() if w.status == "UP") / up, 3)
+        if up > 0
+        else 0
+    )
     
-    if websites:
-        up_websites = [w for w in websites.values() if w.status == "UP"]
-        if up_websites:
-            total_time = sum(w.response_time for w in up_websites)
-            avg_response_time = round(total_time / len(up_websites), 3)
-
+    # SSL certificate stats
+    ssl_expiring_soon = sum(1 for w in websites.values() if w.ssl_expiry_days is not None and w.ssl_expiry_days <= 30)
+    ssl_expired = sum(1 for w in websites.values() if w.ssl_expiry_days is not None and w.ssl_expiry_days <= 0)
+    
     return {
         "total_websites": total,
         "websites_up": up,
         "websites_down": down,
-        "average_response_time": avg_response_time
+        "average_response_time": avg,
+        "ssl_expiring_soon": ssl_expiring_soon,
+        "ssl_expired": ssl_expired
     }
 
+# ---------- Run App ----------
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Starting Simple Website Monitor...")
-    print("📊 Features: Status | Response Time | Traffic Estimation")
-    print("🌐 Server: http://localhost:8000")
-    print("📖 Docs: http://localhost:8000/docs")
     uvicorn.run(app, host="0.0.0.0", port=8000)
